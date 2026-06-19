@@ -75,3 +75,54 @@ git worktree add ../Worktrees/GuideAnts/jobsearch-console feature/jobsearch-cons
 - [ ] Phase 1c: custom storefront/catalog client (TS, generated from OpenAPI) on the public tier
 - [ ] Phase 2: Azure self-host (Container Apps, scale-to-zero); local-inference box via DDNS
 - [ ] Phase 2+: propose a BackgroundJobs feed poller upstream to the proprietor (if proven)
+
+---
+
+## UPDATE — Mac local inference RESOLVED (supersedes the ARM64/Metal investigation above)
+
+**Root cause (settled):** Docker on macOS runs all containers inside a *Linux VM* (Apple
+Virtualization.framework). Metal is a macOS-only API and there is **no GPU passthrough** to the
+guest. So **no container on a Mac can use Metal — ARM64 or AMD64, ever.** It's CPU-only in Docker,
+full stop. (`start_macos.sh:157-158` forces `DOCKER_DEFAULT_PLATFORM=linux/amd64`, and every
+service hardcodes `platform: linux/amd64`, because the GHCR images are AMD64-only. That AMD64
+emulation only slows the *supporting* services; it is NOT the thing blocking Metal.)
+
+**The correct architecture (decided):** Route inference to wherever the GPU lives *natively*.
+On Mac that means **host-native Ollama** (Metal-accelerated), with GuideAnts' containers talking to
+it over the OpenAI-compatible protocol. GuideAnts is provider-routed (Anthropic/Azure/OpenAI/
+OpenRouter/HuggingFace/Llama, per-capability), so this is first-class, not a hack. Same
+OpenAI-compatible seam scales later to the DDNS "special machine" or cloud.
+
+**Validated config** (`OpenAiEmbeddingService.cs:48` reads `OpenAI:Endpoint`, default
+api.openai.com/v1 — overridable):
+```jsonc
+"OpenAI": {
+  "Endpoint": "http://host.docker.internal:11434/v1",  // native Ollama (Metal)
+  "ApiKey": "ollama"                                    // dummy; client wants non-empty
+}
+```
+Then route **chat** + **embeddings** to the OpenAI provider in Settings (likely editable in the
+default UI — settings-editor layer exists: ProviderConfigurationResolver, SettingsEndpoints).
+
+**Gotchas:** (1) embeddings hit `{baseUrl}/embeddings` → need an embedding model pulled
+(`ollama pull nomic-embed-text`), separate from the chat model (`ollama pull llama3.1`);
+(2) `host.docker.internal` reaches the Mac host from containers (add
+`extra_hosts: ["host.docker.internal:host-gateway"]` if it ever doesn't resolve);
+(3) model name in GuideAnts must match the Ollama tag exactly.
+
+**Design rule:** On Apple Silicon, **bypass GuideAnts' bundled containerized `llama-cpp` runtime**
+(`localhost:8110/llama-cpp` → CPU-only on Mac) and route to host Ollama. On a Linux+NVIDIA box the
+containerized runtime CAN use the GPU, so flip back to it there.
+
+**Still to verify on the Mini:** confirm the *chat* completion service reads the same
+`OpenAI:Endpoint` and hits `/v1/chat/completions` (embeddings path is confirmed).
+
+### Updated starter prompt for the MacMini session
+> Continuing GuideAnts JobSearch on the MacMini. Read
+> `Worktrees/GuideAnts/mydocs/HANDOFF.md` — especially the "Mac local inference RESOLVED" section.
+> Decided architecture: route inference to host-native Ollama (Metal) via GuideAnts'
+> OpenAI-compatible provider (`OpenAI:Endpoint=http://host.docker.internal:11434/v1`), NOT the
+> containerized llama-cpp (CPU-only on Mac). Today: (1) confirm the chat completion service honors
+> `OpenAI:Endpoint`; (2) stand up the stack with `docker compose`; (3) pull `llama3.1` +
+> `nomic-embed-text` in host Ollama; (4) wire chat+embeddings to the OpenAI provider in Settings and
+> verify end-to-end in the default UI. Work on the `feature/jobsearch-console` worktree.
